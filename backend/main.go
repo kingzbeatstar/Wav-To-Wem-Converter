@@ -21,7 +21,7 @@ const wineHome = "/home/appuser"
 const winePrefix = "/home/appuser/.wine"
 
 func main() {
-	log.Printf("wav-to-wem API V12 Extended starting")
+	log.Printf("wav-to-wem API V13 Extended starting")
 	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("HOME=%s WINEPREFIX=%s", wineHome, winePrefix)
@@ -81,7 +81,7 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v12-extended",
+		"version": "v13-extended",
 	})
 }
 
@@ -90,7 +90,7 @@ func health(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v12-extended"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v13-extended"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
@@ -100,7 +100,7 @@ func diagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := map[string]any{
-		"version":           "v8",
+		"version":           "v13-extended",
 		"wine_home":         wineHome,
 		"wine_prefix":       winePrefix,
 		"converter":         converter,
@@ -143,7 +143,7 @@ func convert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+(1<<20))
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+1<<20)
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -245,66 +245,12 @@ func convert(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, data)
 }
 
-// ---------- YouTube discovery API ----------
-
-type youtubeSearchResponse struct {
-	Items []youtubeSearchItem `json:"items"`
-}
-
-type youtubeSearchItem struct {
-	ID struct {
-		VideoID string `json:"videoId"`
-	} `json:"id"`
-	Snippet youtubeSnippet `json:"snippet"`
-}
-
-type youtubeVideoListResponse struct {
-	Items []youtubeVideoItem `json:"items"`
-}
-
-type youtubeVideoItem struct {
-	ID      string        `json:"id"`
-	Snippet youtubeSnippet `json:"snippet"`
-	Content youtubeContent `json:"contentDetails"`
-}
-
-type youtubeSnippet struct {
-	Title        string      `json:"title"`
-	Description  string      `json:"description"`
-	ChannelTitle string      `json:"channelTitle"`
-	PublishedAt  string      `json:"publishedAt"`
-	Thumbnails   youtubeThumbs `json:"thumbnails"`
-}
-
-type youtubeThumbs struct {
-	Default youtubeThumb `json:"default"`
-	Medium  youtubeThumb `json:"medium"`
-	High    youtubeThumb `json:"high"`
-}
-
-type youtubeThumb struct {
-	URL string `json:"url"`
-}
-
-type youtubeContent struct {
-	Duration string `json:"duration"`
-}
-
-func youtubeKey() string {
-	return strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY"))
-}
-
+// youtubeSearch uses the official YouTube Data API when a key is configured.
+// Without a key, it returns the official YouTube search URL instead of failing.
+// V13 never scrapes YouTube.
 func youtubeSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	key := youtubeKey()
-	if key == "" {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error":  "YouTube search is not configured",
-			"detail": "Add YOUTUBE_API_KEY to the Render environment variables.",
-		})
 		return
 	}
 
@@ -318,55 +264,80 @@ func youtubeSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p := url.Values{}
-	p.Set("part", "snippet")
-	p.Set("type", "video")
-	p.Set("maxResults", "8")
-	p.Set("q", q)
-	p.Set("key", key)
-
-	body, status, err := youtubeGET(r, "https://www.googleapis.com/youtube/v3/search?"+p.Encode())
-	if err != nil {
-		writeJSON(w, status, map[string]string{
-			"error":  "YouTube search failed",
-			"detail": err.Error(),
+	apiKey := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY"))
+	if apiKey == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"configured": false,
+			"query":      q,
+			"searchUrl":  "https://www.youtube.com/results?search_query=" + url.QueryEscape(q),
+			"message":    "Integrated search is optional. Open YouTube Search, choose a video, and paste its link into the link tab.",
 		})
 		return
 	}
 
-	var sr youtubeSearchResponse
-	if err := json.Unmarshal(body, &sr); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid YouTube search response"})
+	params := url.Values{}
+	params.Set("part", "snippet")
+	params.Set("type", "video")
+	params.Set("maxResults", "8")
+	params.Set("q", q)
+	params.Set("key", apiKey)
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		"https://www.googleapis.com/youtube/v3/search?"+params.Encode(), nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create YouTube request"})
 		return
 	}
 
-	ids := make([]string, 0, len(sr.Items))
-	for _, item := range sr.Items {
-		if item.ID.VideoID != "" {
-			ids = append(ids, item.ID.VideoID)
-		}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not reach YouTube"})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not read YouTube response"})
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("YouTube search API error: %s", clean(body))
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error":  "YouTube search failed",
+			"detail": clean(body),
+		})
+		return
 	}
 
-	durations := make(map[string]string)
-	if len(ids) > 0 {
-		vp := url.Values{}
-		vp.Set("part", "contentDetails")
-		vp.Set("id", strings.Join(ids, ","))
-		vp.Set("key", key)
-
-		vbody, vstatus, verr := youtubeGET(r, "https://www.googleapis.com/youtube/v3/videos?"+vp.Encode())
-		if verr == nil && vstatus >= 200 && vstatus < 300 {
-			var vr youtubeVideoListResponse
-			if json.Unmarshal(vbody, &vr) == nil {
-				for _, item := range vr.Items {
-					durations[item.ID] = item.Content.Duration
-				}
-			}
-		}
+	var raw struct {
+		Items []struct {
+			ID struct {
+				VideoID string `json:"videoId"`
+			} `json:"id"`
+			Snippet struct {
+				Title        string `json:"title"`
+				ChannelTitle string `json:"channelTitle"`
+				PublishedAt  string `json:"publishedAt"`
+				Description  string `json:"description"`
+				Thumbnails   struct {
+					High struct {
+						URL string `json:"url"`
+					} `json:"high"`
+					Medium struct {
+						URL string `json:"url"`
+					} `json:"medium"`
+				} `json:"thumbnails"`
+			} `json:"snippet"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid YouTube response"})
+		return
 	}
 
-	results := make([]map[string]any, 0, len(sr.Items))
-	for _, item := range sr.Items {
+	results := make([]map[string]any, 0, len(raw.Items))
+	for _, item := range raw.Items {
 		id := item.ID.VideoID
 		if id == "" {
 			continue
@@ -382,110 +353,80 @@ func youtubeSearch(w http.ResponseWriter, r *http.Request) {
 			"publishedAt": item.Snippet.PublishedAt,
 			"description": item.Snippet.Description,
 			"thumbnail":   thumb,
-			"duration":    durations[id],
 			"url":         "https://www.youtube.com/watch?v=" + id,
 		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"query":   q,
-		"results": results,
+		"configured": true,
+		"query":      q,
+		"results":    results,
 	})
 }
 
+// youtubeVideo resolves a pasted YouTube link using the documented oEmbed
+// endpoint. It does not require a Data API key and does not download media.
 func youtubeVideo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	key := youtubeKey()
-	if key == "" {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error":  "YouTube lookup is not configured",
-			"detail": "Add YOUTUBE_API_KEY to the Render environment variables.",
-		})
-		return
-	}
 
-	videoID := extractYouTubeVideoID(r.URL.Query().Get("url"))
+	rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
+	videoID := extractYouTubeVideoID(rawURL)
 	if videoID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid YouTube URL"})
 		return
 	}
 
-	p := url.Values{}
-	p.Set("part", "snippet,contentDetails")
-	p.Set("id", videoID)
-	p.Set("key", key)
-
-	body, status, err := youtubeGET(r, "https://www.googleapis.com/youtube/v3/videos?"+p.Encode())
+	canonicalURL := "https://www.youtube.com/watch?v=" + videoID
+	oembedURL := "https://www.youtube.com/oembed?url=" + url.QueryEscape(canonicalURL) + "&format=json"
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, oembedURL, nil)
 	if err != nil {
-		writeJSON(w, status, map[string]string{
-			"error":  "YouTube lookup failed",
-			"detail": err.Error(),
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create YouTube metadata request"})
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not reach YouTube"})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error":  "YouTube video lookup failed",
+			"detail": clean(body),
 		})
 		return
 	}
 
-	var vr youtubeVideoListResponse
-	if err := json.Unmarshal(body, &vr); err != nil || len(vr.Items) == 0 {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "YouTube video was not found"})
+	var meta struct {
+		Title      string `json:"title"`
+		AuthorName string `json:"author_name"`
+		Thumbnail  string `json:"thumbnail_url"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid YouTube metadata response"})
 		return
 	}
 
-	item := vr.Items[0]
-	thumb := item.Snippet.Thumbnails.High.URL
-	if thumb == "" {
-		thumb = item.Snippet.Thumbnails.Medium.URL
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"videoId":     videoID,
-		"title":       item.Snippet.Title,
-		"channel":     item.Snippet.ChannelTitle,
-		"publishedAt": item.Snippet.PublishedAt,
-		"description": item.Snippet.Description,
-		"thumbnail":   thumb,
-		"duration":    item.Content.Duration,
-		"url":         "https://www.youtube.com/watch?v=" + videoID,
+		"videoId":    videoID,
+		"title":      meta.Title,
+		"channel":    meta.AuthorName,
+		"thumbnail":  meta.Thumbnail,
+		"url":        canonicalURL,
+		"searchMode": "keyless-oembed",
 	})
 }
 
-func youtubeGET(r *http.Request, endpoint string) ([]byte, int, error) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, http.StatusInternalServerError, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, http.StatusBadGateway, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		return nil, http.StatusBadGateway, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, http.StatusBadGateway, fmt.Errorf("%s", clean(body))
-	}
-	return body, resp.StatusCode, nil
-}
-
 func extractYouTubeVideoID(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if len(raw) == 11 && !strings.ContainsAny(raw, "./?&=") {
-		return raw
-	}
-
-	u, err := url.Parse(raw)
+	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return ""
 	}
-
 	host := strings.ToLower(u.Hostname())
 	if host == "youtu.be" {
 		id := strings.Trim(u.Path, "/")
@@ -494,15 +435,13 @@ func extractYouTubeVideoID(raw string) string {
 		}
 		return ""
 	}
-
-	if !strings.HasSuffix(host, "youtube.com") && host != "www.youtube-nocookie.com" {
+	if host != "youtube.com" && host != "www.youtube.com" && host != "m.youtube.com" &&
+		host != "youtube-nocookie.com" && host != "www.youtube-nocookie.com" {
 		return ""
 	}
-
 	if id := u.Query().Get("v"); len(id) == 11 {
 		return id
 	}
-
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	for i, part := range parts {
 		if (part == "shorts" || part == "embed" || part == "live") && i+1 < len(parts) {
@@ -514,7 +453,6 @@ func extractYouTubeVideoID(raw string) string {
 	}
 	return ""
 }
-
 
 func wineEnv() []string {
 	remove := map[string]bool{
