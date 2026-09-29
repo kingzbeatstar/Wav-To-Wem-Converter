@@ -1,13 +1,13 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,20 +17,12 @@ import (
 
 const maxUpload = 200 << 20 // 200 MiB
 const converter = "/opt/wav2wem/wav2wem.exe"
-const vorbisQuality = "6"
-
-// Beatstar/Wwise reference profile observed from the known-good WEM.
-const beatstarStereoLayout uint32 = 0x3102
-const beatstarDecodeAlloc uint32 = 16080
-const beatstarX64Alloc uint32 = 16560
-const beatstarCodebookUID uint32 = 0xD54BA8E8
-const beatstarAvgBytes uint32 = 23992
 const wineHome = "/home/appuser"
 const winePrefix = "/home/appuser/.wine"
 
 func main() {
-	log.Printf("wav-to-wem API starting")
-	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine, Vorbis Quality 6 (Beatstar profile)")
+	log.Printf("wav-to-wem API V12 Extended starting")
+	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("HOME=%s WINEPREFIX=%s", wineHome, winePrefix)
 
@@ -64,6 +56,8 @@ func main() {
 	mux.HandleFunc("/health", health)
 	mux.HandleFunc("/diagnostics", diagnostics)
 	mux.HandleFunc("/convert", convert)
+	mux.HandleFunc("/youtube/search", youtubeSearch)
+	mux.HandleFunc("/youtube/video", youtubeVideo)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -87,7 +81,7 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v11",
+		"version": "v12-extended",
 	})
 }
 
@@ -96,7 +90,7 @@ func health(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v11"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v12-extended"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
@@ -106,18 +100,12 @@ func diagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := map[string]any{
-		"version":               "v11",
-		"wine_home":             wineHome,
-		"wine_prefix":           winePrefix,
-		"converter":             converter,
-		"converter_present":     fileExists(converter),
-		"prefix_present":        fileExists(winePrefix),
-		"vorbis_quality":        vorbisQuality,
-		"beatstar_profile":      true,
-		"beatstar_layout":       fmt.Sprintf("0x%08X", beatstarStereoLayout),
-		"beatstar_decode_alloc": beatstarDecodeAlloc,
-		"beatstar_x64_alloc":    beatstarX64Alloc,
-		"beatstar_uid":          fmt.Sprintf("0x%08X", beatstarCodebookUID),
+		"version":           "v8",
+		"wine_home":         wineHome,
+		"wine_prefix":       winePrefix,
+		"converter":         converter,
+		"converter_present": fileExists(converter),
+		"prefix_present":    fileExists(winePrefix),
 	}
 
 	wineOut, wineErr := runWine("--version")
@@ -200,11 +188,7 @@ func convert(w http.ResponseWriter, r *http.Request) {
 		"-o",
 		winePath(output),
 		"-q",
-		vorbisQuality,
-		"-decode-alloc",
-		fmt.Sprint(beatstarDecodeAlloc),
-		"-x64-alloc",
-		fmt.Sprint(beatstarX64Alloc),
+		"4",
 	}
 
 	log.Printf("starting conversion: %s", header.Filename)
@@ -231,16 +215,6 @@ func convert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("conversion succeeded in %s", elapsed.Round(time.Millisecond))
-
-	if err := applyBeatstarHeaderProfile(output); err != nil {
-		log.Printf("Beatstar header patch failed: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error":  "Beatstar WEM post-processing failed",
-			"detail": err.Error(),
-		})
-		return
-	}
-	log.Printf("Beatstar header profile applied: layout=0x%08X uid=0x%08X avgBytes=%d", beatstarStereoLayout, beatstarCodebookUID, beatstarAvgBytes)
 
 	info, err := os.Stat(output)
 	if err != nil || info.Size() == 0 {
@@ -270,6 +244,277 @@ func convert(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, data)
 }
+
+// ---------- YouTube discovery API ----------
+
+type youtubeSearchResponse struct {
+	Items []youtubeSearchItem `json:"items"`
+}
+
+type youtubeSearchItem struct {
+	ID struct {
+		VideoID string `json:"videoId"`
+	} `json:"id"`
+	Snippet youtubeSnippet `json:"snippet"`
+}
+
+type youtubeVideoListResponse struct {
+	Items []youtubeVideoItem `json:"items"`
+}
+
+type youtubeVideoItem struct {
+	ID      string        `json:"id"`
+	Snippet youtubeSnippet `json:"snippet"`
+	Content youtubeContent `json:"contentDetails"`
+}
+
+type youtubeSnippet struct {
+	Title        string      `json:"title"`
+	Description  string      `json:"description"`
+	ChannelTitle string      `json:"channelTitle"`
+	PublishedAt  string      `json:"publishedAt"`
+	Thumbnails   youtubeThumbs `json:"thumbnails"`
+}
+
+type youtubeThumbs struct {
+	Default youtubeThumb `json:"default"`
+	Medium  youtubeThumb `json:"medium"`
+	High    youtubeThumb `json:"high"`
+}
+
+type youtubeThumb struct {
+	URL string `json:"url"`
+}
+
+type youtubeContent struct {
+	Duration string `json:"duration"`
+}
+
+func youtubeKey() string {
+	return strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY"))
+}
+
+func youtubeSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	key := youtubeKey()
+	if key == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error":  "YouTube search is not configured",
+			"detail": "Add YOUTUBE_API_KEY to the Render environment variables.",
+		})
+		return
+	}
+
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing search query"})
+		return
+	}
+	if len(q) > 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "search query is too long"})
+		return
+	}
+
+	p := url.Values{}
+	p.Set("part", "snippet")
+	p.Set("type", "video")
+	p.Set("maxResults", "8")
+	p.Set("q", q)
+	p.Set("key", key)
+
+	body, status, err := youtubeGET(r, "https://www.googleapis.com/youtube/v3/search?"+p.Encode())
+	if err != nil {
+		writeJSON(w, status, map[string]string{
+			"error":  "YouTube search failed",
+			"detail": err.Error(),
+		})
+		return
+	}
+
+	var sr youtubeSearchResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid YouTube search response"})
+		return
+	}
+
+	ids := make([]string, 0, len(sr.Items))
+	for _, item := range sr.Items {
+		if item.ID.VideoID != "" {
+			ids = append(ids, item.ID.VideoID)
+		}
+	}
+
+	durations := make(map[string]string)
+	if len(ids) > 0 {
+		vp := url.Values{}
+		vp.Set("part", "contentDetails")
+		vp.Set("id", strings.Join(ids, ","))
+		vp.Set("key", key)
+
+		vbody, vstatus, verr := youtubeGET(r, "https://www.googleapis.com/youtube/v3/videos?"+vp.Encode())
+		if verr == nil && vstatus >= 200 && vstatus < 300 {
+			var vr youtubeVideoListResponse
+			if json.Unmarshal(vbody, &vr) == nil {
+				for _, item := range vr.Items {
+					durations[item.ID] = item.Content.Duration
+				}
+			}
+		}
+	}
+
+	results := make([]map[string]any, 0, len(sr.Items))
+	for _, item := range sr.Items {
+		id := item.ID.VideoID
+		if id == "" {
+			continue
+		}
+		thumb := item.Snippet.Thumbnails.High.URL
+		if thumb == "" {
+			thumb = item.Snippet.Thumbnails.Medium.URL
+		}
+		results = append(results, map[string]any{
+			"videoId":     id,
+			"title":       item.Snippet.Title,
+			"channel":     item.Snippet.ChannelTitle,
+			"publishedAt": item.Snippet.PublishedAt,
+			"description": item.Snippet.Description,
+			"thumbnail":   thumb,
+			"duration":    durations[id],
+			"url":         "https://www.youtube.com/watch?v=" + id,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"query":   q,
+		"results": results,
+	})
+}
+
+func youtubeVideo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	key := youtubeKey()
+	if key == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error":  "YouTube lookup is not configured",
+			"detail": "Add YOUTUBE_API_KEY to the Render environment variables.",
+		})
+		return
+	}
+
+	videoID := extractYouTubeVideoID(r.URL.Query().Get("url"))
+	if videoID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid YouTube URL"})
+		return
+	}
+
+	p := url.Values{}
+	p.Set("part", "snippet,contentDetails")
+	p.Set("id", videoID)
+	p.Set("key", key)
+
+	body, status, err := youtubeGET(r, "https://www.googleapis.com/youtube/v3/videos?"+p.Encode())
+	if err != nil {
+		writeJSON(w, status, map[string]string{
+			"error":  "YouTube lookup failed",
+			"detail": err.Error(),
+		})
+		return
+	}
+
+	var vr youtubeVideoListResponse
+	if err := json.Unmarshal(body, &vr); err != nil || len(vr.Items) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "YouTube video was not found"})
+		return
+	}
+
+	item := vr.Items[0]
+	thumb := item.Snippet.Thumbnails.High.URL
+	if thumb == "" {
+		thumb = item.Snippet.Thumbnails.Medium.URL
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"videoId":     videoID,
+		"title":       item.Snippet.Title,
+		"channel":     item.Snippet.ChannelTitle,
+		"publishedAt": item.Snippet.PublishedAt,
+		"description": item.Snippet.Description,
+		"thumbnail":   thumb,
+		"duration":    item.Content.Duration,
+		"url":         "https://www.youtube.com/watch?v=" + videoID,
+	})
+}
+
+func youtubeGET(r *http.Request, endpoint string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, http.StatusBadGateway, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, http.StatusBadGateway, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, http.StatusBadGateway, fmt.Errorf("%s", clean(body))
+	}
+	return body, resp.StatusCode, nil
+}
+
+func extractYouTubeVideoID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if len(raw) == 11 && !strings.ContainsAny(raw, "./?&=") {
+		return raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+
+	host := strings.ToLower(u.Hostname())
+	if host == "youtu.be" {
+		id := strings.Trim(u.Path, "/")
+		if len(id) == 11 {
+			return id
+		}
+		return ""
+	}
+
+	if !strings.HasSuffix(host, "youtube.com") && host != "www.youtube-nocookie.com" {
+		return ""
+	}
+
+	if id := u.Query().Get("v"); len(id) == 11 {
+		return id
+	}
+
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, part := range parts {
+		if (part == "shorts" || part == "embed" || part == "live") && i+1 < len(parts) {
+			id := parts[i+1]
+			if len(id) == 11 {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 
 func wineEnv() []string {
 	remove := map[string]bool{
@@ -307,63 +552,6 @@ func runWine(args ...string) ([]byte, error) {
 func winePath(p string) string {
 	p = filepath.ToSlash(filepath.Clean(p))
 	return "Z:" + strings.ReplaceAll(p, "/", `\`)
-}
-
-func applyBeatstarHeaderProfile(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	if len(b) < 12 || string(b[:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
-		return fmt.Errorf("not a RIFF/WAVE file")
-	}
-
-	p := 12
-	var fmtData []byte
-	var fmtDataOffset int
-	for p+8 <= len(b) {
-		id := string(b[p : p+4])
-		ln := int(binary.LittleEndian.Uint32(b[p+4 : p+8]))
-		start := p + 8
-		end := start + ln
-		if end > len(b) {
-			return fmt.Errorf("invalid RIFF chunk %q", id)
-		}
-		if id == "fmt " {
-			fmtData = b[start:end]
-			fmtDataOffset = start
-			break
-		}
-		p = end
-		if ln&1 != 0 {
-			p++
-		}
-	}
-
-	if len(fmtData) < 66 {
-		return fmt.Errorf("WEM fmt chunk is only %d bytes; expected at least 66", len(fmtData))
-	}
-	if binary.LittleEndian.Uint16(fmtData[0:2]) != 0xFFFF {
-		return fmt.Errorf("unexpected codec tag 0x%04X", binary.LittleEndian.Uint16(fmtData[0:2]))
-	}
-	if binary.LittleEndian.Uint16(fmtData[2:4]) != 2 {
-		return fmt.Errorf("Beatstar profile expects stereo, got %d channels", binary.LittleEndian.Uint16(fmtData[2:4]))
-	}
-	if binary.LittleEndian.Uint32(fmtData[4:8]) != 44100 {
-		return fmt.Errorf("Beatstar profile expects 44100 Hz, got %d", binary.LittleEndian.Uint32(fmtData[4:8]))
-	}
-
-	// fmt+0x14: Wwise channel configuration (standard FL|FR stereo = 0x3102).
-	binary.LittleEndian.PutUint32(b[fmtDataOffset+0x14:fmtDataOffset+0x18], beatstarStereoLayout)
-	// fmt+0x08: nominal average bytes/sec. Reference Beatstar WEM uses 23992.
-	binary.LittleEndian.PutUint32(b[fmtDataOffset+0x08:fmtDataOffset+0x0C], beatstarAvgBytes)
-	// fmt+0x34 / +0x38: decoder allocation hints.
-	binary.LittleEndian.PutUint32(b[fmtDataOffset+0x34:fmtDataOffset+0x38], beatstarDecodeAlloc)
-	binary.LittleEndian.PutUint32(b[fmtDataOffset+0x38:fmtDataOffset+0x3C], beatstarX64Alloc)
-	// fmt+0x3C: common Wwise codebook UID observed in the known-good Beatstar WEM.
-	binary.LittleEndian.PutUint32(b[fmtDataOffset+0x3C:fmtDataOffset+0x40], beatstarCodebookUID)
-
-	return os.WriteFile(path, b, 0644)
 }
 
 func saveUpload(src multipart.File, dst string) error {

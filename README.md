@@ -1,47 +1,54 @@
-# WAV to WEM Render V11 — Beatstar/Wwise compatibility profile
+# WAV & YouTube to WEM Converter — V12 Extended
 
-V11 keeps the working WineHQ + Windows `wav2wem.exe` backend and the 200 MB upload limit, but applies a targeted Beatstar/Wwise output profile.
+V12 Extended keeps the proven V8 WAV -> WEM backend and adds YouTube discovery:
+- Add a YouTube video link and look up the exact video.
+- Search YouTube for a song and choose the correct result using thumbnail/title/channel/duration.
+- After selection, upload the authorized WAV for that video and use the existing WEM conversion.
 
-## V11 changes
+## Important YouTube limitation
 
-- Windows `wav2wem.exe` v0.1 runs through WineHQ stable.
-- Vorbis quality changed to `-q 6`.
-- Post-processing applies the observed values from the known-good Beatstar reference WEM:
-  - stereo layout: `0x00003102`
-  - decode allocation: `16080`
-  - x64 decode allocation: `16560`
-  - codebook UID: `0xD54BA8E8`
-  - nominal average bytes/sec: `23992` (~192 kbps)
-- Upload limit remains 200 MiB.
+The YouTube Data API can be used for search and video metadata, but YouTube's current Developer Policies prohibit API clients from allowing users to download or separate audio tracks from YouTube videos. This build therefore does NOT implement automatic YouTube audio downloading.
 
-These header values are based on the supplied known-good Beatstar WEM. They are a compatibility test and are not claimed to be byte-identical to proprietary Wwise authoring output.
+## Google Cloud / YouTube API setup
 
-## Repository layout
+1. Create/select a Google Cloud project.
+2. Enable **YouTube Data API v3**.
+3. Create an API key.
+4. In Render -> your service -> Environment, add:
+   `YOUTUBE_API_KEY=<your-key>`
+5. Redeploy the service.
 
-repo/
+The key remains on the server and is never placed in the HTML.
+
+## Files
+
+- `wav-to-wem.html` — replace your current site page.
+- `backend/Dockerfile` — proven Wine 11 / wav2wem setup.
+- `backend/main.go` — WEM API plus `/youtube/search` and `/youtube/video`.
+- `backend/go.mod`
 - `render.yaml`
-- `backend/`
-  - `Dockerfile`
-  - `go.mod`
-  - `main.go`
-- `wav-to-wem.html`
 
 ## Render settings
 
+Keep:
 - Runtime: Docker
 - Root Directory: `backend`
 - Dockerfile Path: `Dockerfile`
 - Docker Build Context: `.`
 - Health Check Path: `/health`
 
-After pushing V11, deploy the backend. Using **Manual Deploy -> Clear build cache & deploy** is safe if you want a completely fresh image.
+## Endpoints
 
-## Expected startup / diagnostics
+- `GET /health`
+- `GET /diagnostics`
+- `POST /convert`
+- `GET /youtube/search?q=...`
+- `GET /youtube/video?url=...`
 
-`/health` should report version `v11`.
+## 200 MB WAV limit
 
-`/diagnostics` should report the V11 converter and Beatstar profile values, including Vorbis quality `6`.
+The frontend and backend both use a 200 MB limit.
 
-## Website
+## Note
 
-Replace the existing `wav-to-wem.html` with the included version. The API endpoint does not change.
+Search requests to YouTube's `search.list` endpoint consume API quota, so the UI intentionally searches only on user action instead of firing requests for every keystroke.
