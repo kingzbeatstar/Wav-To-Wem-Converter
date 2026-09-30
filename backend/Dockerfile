@@ -6,31 +6,30 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wav-to-wem-api ./m
 FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
-# WineHQ stable is used because wav2wem.exe is a Windows Go binary.
 RUN dpkg --add-architecture i386 \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg git ffmpeg unzip \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://dl.winehq.org/wine-builds/winehq.key \
        | gpg --dearmor --yes -o /etc/apt/keyrings/winehq-archive.key \
     && curl -fsSL https://dl.winehq.org/wine-builds/debian/dists/bookworm/winehq-bookworm.sources \
        -o /etc/apt/sources.list.d/winehq-bookworm.sources \
     && apt-get update \
-    && apt-get install -y --install-recommends winehq-stable ffmpeg unzip \
+    && apt-get install -y --install-recommends winehq-stable \
     && rm -rf /var/lib/apt/lists/*
 
-# yt-dlp currently requires an external JavaScript runtime for full YouTube support.
-# Use the official standalone Linux binary plus Deno and the bundled EJS components.
-ARG YTDLP_VERSION=2026.08.19
+ARG YTDLP_VERSION=2026.09.16.232951
 ARG DENO_VERSION=2.9.7
+ARG BGUTIL_VERSION=2.0.0
+
 RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /opt/wav2wem /opt/yt-dlp /home/appuser/.wine \
+    && mkdir -p /opt/wav2wem /opt/yt-dlp /opt/bgutil-ytdlp-pot-provider /home/appuser/.wine \
     && curl -fsSL --retry 5 --retry-delay 2 \
        https://github.com/pas2k/wav2wem/releases/download/v0.1/wav2wem.exe \
        -o /opt/wav2wem/wav2wem.exe \
     && chmod 755 /opt/wav2wem/wav2wem.exe \
     && curl -fsSL --retry 5 --retry-delay 2 \
-       https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp_linux \
+       https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/${YTDLP_VERSION}/yt-dlp_linux \
        -o /opt/yt-dlp/yt-dlp \
     && chmod 755 /opt/yt-dlp/yt-dlp \
     && curl -fsSL --retry 5 --retry-delay 2 \
@@ -38,10 +37,18 @@ RUN useradd --create-home --uid 10001 appuser \
        -o /tmp/deno.zip \
     && unzip -q /tmp/deno.zip -d /opt/yt-dlp \
     && rm -f /tmp/deno.zip \
-    && rm -rf /var/lib/apt/lists/* \
-    && chown -R appuser:appuser /opt/wav2wem /opt/yt-dlp /home/appuser
+    && git clone --depth 1 --branch ${BGUTIL_VERSION} \
+       https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+       /opt/bgutil-ytdlp-pot-provider \
+    && cd /opt/bgutil-ytdlp-pot-provider/server \
+    && /opt/yt-dlp/deno install --allow-scripts=npm:canvas --frozen \
+    && mkdir -p /opt/yt-dlp/yt-dlp-plugins/bgutil-ytdlp-pot-provider \
+    && cp -a /opt/bgutil-ytdlp-pot-provider/plugin/. /opt/yt-dlp/yt-dlp-plugins/bgutil-ytdlp-pot-provider/ \
+    && chown -R appuser:appuser /opt/wav2wem /opt/yt-dlp /opt/bgutil-ytdlp-pot-provider /home/appuser
 
 COPY --from=build /out/wav-to-wem-api /usr/local/bin/wav-to-wem-api
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh
 
 ENV HOME=/home/appuser
 ENV WINEPREFIX=/home/appuser/.wine
@@ -53,4 +60,4 @@ ENV PATH=/opt/yt-dlp:$PATH
 USER appuser
 WORKDIR /home/appuser
 EXPOSE 10000
-ENTRYPOINT ["/usr/local/bin/wav-to-wem-api"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

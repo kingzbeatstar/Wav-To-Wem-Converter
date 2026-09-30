@@ -24,6 +24,7 @@ const maxUpload = 200 << 20 // 200 MiB
 const converter = "/opt/wav2wem/wav2wem.exe"
 const ytdlp = "/opt/yt-dlp/yt-dlp"
 const deno = "/opt/yt-dlp/deno"
+const bgutilPing = "http://127.0.0.1:4416/ping"
 const wineHome = "/home/appuser"
 const winePrefix = "/home/appuser/.wine"
 const maxYouTubeWAV = 200 << 20 // Keep generated WAV within the same 200 MB service limit.
@@ -58,7 +59,7 @@ type youtubeJobRequest struct {
 }
 
 func main() {
-	log.Printf("wav-to-wem API V15 Extended starting")
+	log.Printf("wav-to-wem API V16 Extended starting")
 	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("yt-dlp: %s", ytdlp)
@@ -99,6 +100,11 @@ func main() {
 	} else {
 		log.Printf("DENO SELF-TEST OK: %s", firstLine(clean(out)))
 	}
+	if out, err := execCommand("curl", "-fsS", bgutilPing); err != nil {
+		log.Fatalf("BGUTIL POT PROVIDER SELF-TEST FAILED: %v: %s", err, clean(out))
+	} else {
+		log.Printf("BGUTIL POT PROVIDER SELF-TEST OK: %s", clean(out))
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", root)
@@ -124,12 +130,12 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v15-extended",
+		"version": "v16-extended",
 	})
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v15-extended"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v16-extended"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
@@ -143,6 +149,7 @@ func diagnostics(w http.ResponseWriter, r *http.Request) {
 		"yt_dlp_present":         fileExists(ytdlp),
 		"deno_present":           fileExists(deno),
 		"youtube_api_configured": youtubeAPIKey() != "",
+		"bgutil_provider": bgutilPing,
 	}
 	out, err := runWine("--version")
 	result["wine_available"] = err == nil
@@ -166,6 +173,12 @@ func diagnostics(w http.ResponseWriter, r *http.Request) {
 	out, err = execCommand(deno, "--version")
 	result["deno_self_test"] = err == nil
 	result["deno_output"] = clean(out)
+	out, err = execCommand("curl", "-fsS", bgutilPing)
+	result["bgutil_self_test"] = err == nil
+	result["bgutil_output"] = clean(out)
+	if err != nil {
+		result["bgutil_error"] = err.Error()
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -299,7 +312,9 @@ func runYouTubeJob(job *YouTubeJob, thumbnail string) {
 		"--progress",
 		"--progress-delta", "1",
 		"--progress-template", "download:PROGRESS=%(progress._percent_str)s",
-		"--js-runtimes", "deno",
+		"--js-runtimes", "deno:/opt/yt-dlp/deno",
+		"--extractor-args", "youtube:player-client=web_embedded,mweb",
+		"--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
 		"--extract-audio",
 		"--audio-format", "wav",
 		"--audio-quality", "0",
@@ -650,8 +665,11 @@ func findWAV(dir string) (string, error) {
 
 func youtubeFriendlyError(detail string) string {
 	lower := strings.ToLower(detail)
-	if strings.Contains(lower, "sign in") || strings.Contains(lower, "bot") || strings.Contains(lower, "confirm you’re not a bot") {
-		return "YouTube did not allow this server-side download attempt. Try another video or try again later."
+	if strings.Contains(lower, "po token") || strings.Contains(lower, "proof of origin") {
+		return "YouTube rejected the download request after token verification. The server-side YouTube access layer could not obtain a usable stream token. Try another video or try again later."
+	}
+	if strings.Contains(lower, "sign in") || strings.Contains(lower, "bot") || strings.Contains(lower, "confirm you’re not a bot") || strings.Contains(lower, "http error 403") || strings.Contains(lower, "http error 429") {
+		return "YouTube refused the server-side media request (bot/rate-limit/stream protection). The converter now retries with the current compatibility/token provider, but YouTube may still refuse particular videos or Render IPs."
 	}
 	if strings.Contains(lower, "requested format is not available") || strings.Contains(lower, "no formats found") {
 		return "YouTube did not provide a downloadable audio format for this video."

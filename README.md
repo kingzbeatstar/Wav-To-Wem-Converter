@@ -1,87 +1,66 @@
-# WAV & YouTube to WEM — V15 Extended
+# WAV & YouTube to WEM — V16 Extended
 
-V15 changes the YouTube workflow to the requested one-click pipeline:
+V16 keeps the working V15 YouTube -> WAV -> WEM pipeline, but fixes the current YouTube server-side download failure by adding the current yt-dlp Proof-of-Origin token provider and a newer yt-dlp nightly build.
 
-YouTube link/search -> download audio -> create WAV -> convert WAV -> WEM -> download WEM
+## Pipeline
 
-There is **no user WAV upload step in the YouTube mode**.
+YouTube link/search -> select video -> download authorized audio -> WAV -> wav2wem/Wine 11 -> WEM -> automatic download.
 
-## What changed
+There is no user-WAV upload in YouTube mode.
 
-- Keeps the working WAV -> WEM endpoint and 200 MB WAV limit.
-- Adds `/youtube/convert` to start a server-side conversion job.
-- Adds `/youtube/job?id=...` for progress polling.
-- Adds `/youtube/download?id=...` for the finished WEM.
-- Uses `yt-dlp` to download the selected video's best available audio and FFmpeg to convert it to WAV.
-- Sends the generated WAV through the existing `wav2wem.exe` + Wine 11 WEM pipeline.
-- Runs YouTube work asynchronously so the browser is not stuck on one long HTTP request.
-- Frontend shows stages: download/extract audio -> WAV ready -> WEM conversion -> complete.
-- Search remains in-page using the existing YouTube Data API key.
-- Direct YouTube links still work using oEmbed metadata and do not require a Data API key.
-- The selected video remains previewable in the embedded YouTube player.
+## What changed from V15
 
-## Current downloader runtime
+- yt-dlp nightly 2026.09.16.232951 instead of the older stable binary.
+- bgutil-ytdlp-pot-provider 2.0.0 is installed as a yt-dlp plugin.
+- The provider runs locally inside the same Render container on 127.0.0.1:4416.
+- yt-dlp is told to use the embeddable client first and mweb as a token-backed fallback.
+- The provider URL is explicitly supplied to yt-dlp.
+- Startup performs a provider self-test and the API diagnostics endpoint reports it.
+- The 200 MB WAV upload path and proven WAV -> WEM path remain unchanged.
 
-The container pins:
-- yt-dlp 2026.08.19
-- Deno 2.9.7
+The yt-dlp project currently documents that YouTube may require Proof-of-Origin tokens and recommends a PO Token provider plugin. The current provider project's 2.0.0 release is the latest release and includes security fixes; it binds locally by default. See the sources below.
 
-Current yt-dlp documentation says full YouTube support requires a supported external JavaScript runtime and yt-dlp's EJS components; Deno is the recommended runtime. See the official yt-dlp EJS documentation.
+## Render settings
 
-## Render
+Runtime: Docker
+Root Directory: backend
+Dockerfile Path: Dockerfile
+Docker Build Context: .
+Health Check Path: /health
 
-Keep:
-- Runtime: Docker
-- Root Directory: backend
-- Dockerfile Path: Dockerfile
-- Docker Build Context: .
-- Health Check Path: /health
-- Plan: free
-
-After pushing V15, use **Manual Deploy -> Clear build cache & deploy** so the new yt-dlp/Deno dependencies are definitely installed.
+After pushing V16, use **Manual Deploy -> Clear build cache & deploy** because the image now includes new yt-dlp/plugin/provider layers.
 
 ## Environment
 
-Keep your existing:
-
+Keep:
 `YOUTUBE_API_KEY=...`
 
-No additional YouTube environment variable is required by V15.
-
-## Website
-
-Replace the current `wav-to-wem.html` with the V15 Extended file.
-
-The frontend continues to call:
-
-`https://wav-to-wem-converter.onrender.com`
-
-## YouTube flow
-
-1. Open YouTube -> WEM.
-2. Paste a YouTube link OR search for the song.
-3. Pick the exact video.
-4. Preview it on the page.
-5. Check the authorization confirmation.
-6. Click **Convert to WAV + WEM**.
-7. V15 downloads the audio server-side, creates a WAV, converts the WAV to WEM, and automatically downloads the WEM.
-
-## Important usage note
-
-Only use the YouTube conversion path for audio/video you are authorized to download and use. YouTube's Terms restrict downloading and automated access except where specifically permitted, by permission, or by applicable law. Using the official YouTube Data API for search also does not grant download rights.
-
-V15 does not bypass DRM or other access controls. If YouTube refuses a server-side download, the job reports the failure instead of attempting to circumvent the restriction.
+No new secret is required for the PO-token provider.
 
 ## Diagnostics
 
 After deploy:
-
 `https://wav-to-wem-converter.onrender.com/diagnostics`
 
 Look for:
-- `version: v15-extended`
-- `yt_dlp_self_test: true`
-- `deno_self_test: true`
-- `wav2wem_self_test: true`
-- `youtube_api_configured: true`
+- version: v16-extended
+- yt_dlp_self_test: true
+- deno_self_test: true
+- bgutil_self_test: true
+- wav2wem_self_test: true
+- youtube_api_configured: true
 
+## YouTube usage
+
+Use this conversion path only for audio/video you are authorized to download and use. The provider and yt-dlp do not grant permission to download content.
+
+Providing a PO token does not guarantee that YouTube will allow a particular server-side request; the upstream provider explicitly warns that it may not eliminate 403s or bot checks. If YouTube blocks a request on the Render IP, V16 reports the failure rather than attempting to defeat additional access controls.
+
+## Files
+
+- wav-to-wem.html — replace the current website page
+- backend/Dockerfile — replace current Dockerfile
+- backend/entrypoint.sh — add this new file
+- backend/main.go — replace current backend
+- backend/go.mod
+- render.yaml
