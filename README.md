@@ -1,45 +1,36 @@
-# WAV & YouTube to WEM — V14 Extended
+# WAV & YouTube to WEM — V15 Extended
 
-V14 addresses the three reported YouTube problems:
+V15 changes the YouTube workflow to the requested one-click pipeline:
 
-- Search no longer redirects to YouTube. It calls the Render backend and renders results in the page.
-- Search results are filtered to videos that allow embedding when the YouTube Data API key is configured.
-- The embedded player uses YouTube's documented embed URL with `enablejsapi=1`, `playsinline=1`, and the current page origin. A fallback link appears if a video cannot be embedded.
-- Direct-link lookup does not require the Data API key; it uses YouTube oEmbed metadata.
-- WAV -> WEM remains the proven 200 MB Wine 11 / wav2wem pipeline.
+YouTube link/search -> download audio -> create WAV -> convert WAV -> WEM -> download WEM
 
-## IMPORTANT: enable integrated search
+There is **no user WAV upload step in the YouTube mode**.
 
-For search to return actual YouTube results inside your page, you need one Render environment variable:
+## What changed
 
-`YOUTUBE_API_KEY=YOUR_GOOGLE_CLOUD_API_KEY`
+- Keeps the working WAV -> WEM endpoint and 200 MB WAV limit.
+- Adds `/youtube/convert` to start a server-side conversion job.
+- Adds `/youtube/job?id=...` for progress polling.
+- Adds `/youtube/download?id=...` for the finished WEM.
+- Uses `yt-dlp` to download the selected video's best available audio and FFmpeg to convert it to WAV.
+- Sends the generated WAV through the existing `wav2wem.exe` + Wine 11 WEM pipeline.
+- Runs YouTube work asynchronously so the browser is not stuck on one long HTTP request.
+- Frontend shows stages: download/extract audio -> WAV ready -> WEM conversion -> complete.
+- Search remains in-page using the existing YouTube Data API key.
+- Direct YouTube links still work using oEmbed metadata and do not require a Data API key.
+- The selected video remains previewable in the embedded YouTube player.
 
-In Google Cloud, enable **YouTube Data API v3** for the project, create an API key, then in Render:
+## Current downloader runtime
 
-1. Open `wav-to-wem-converter`.
-2. Open **Environment**.
-3. Add `YOUTUBE_API_KEY` and paste the key as its value.
-4. Save the environment changes.
-5. Deploy the latest commit.
+The container pins:
+- yt-dlp 2026.08.19
+- Deno 2.9.7
 
-The key stays server-side. It is never placed in the HTML.
+Current yt-dlp documentation says full YouTube support requires a supported external JavaScript runtime and yt-dlp's EJS components; Deno is the recommended runtime. See the official yt-dlp EJS documentation.
 
-V14 does not intentionally fall back to an external YouTube search page; without the key it shows a configuration message on the same page instead.
+## Render
 
-## Direct YouTube link
-
-Paste a normal `youtube.com/watch?v=...`, `youtu.be/...`, `/shorts/...`, `/embed/...`, or `/live/...` URL. The page resolves metadata without leaving the site, then embeds the video.
-
-## Video playback
-
-Some YouTube videos cannot be embedded by their owners. Those can still be identified through the link workflow, but the player may refuse playback. Integrated search filters for embeddable videos using the Data API.
-
-## About the WAV -> WEM step
-
-V14 keeps the working conversion pipeline. Selecting a YouTube video identifies the track; the conversion step accepts a WAV you are authorized to use and produces WEM.
-
-## Render settings
-
+Keep:
 - Runtime: Docker
 - Root Directory: backend
 - Dockerfile Path: Dockerfile
@@ -47,6 +38,50 @@ V14 keeps the working conversion pipeline. Selecting a YouTube video identifies 
 - Health Check Path: /health
 - Plan: free
 
+After pushing V15, use **Manual Deploy -> Clear build cache & deploy** so the new yt-dlp/Deno dependencies are definitely installed.
+
+## Environment
+
+Keep your existing:
+
+`YOUTUBE_API_KEY=...`
+
+No additional YouTube environment variable is required by V15.
+
 ## Website
 
-Replace your current `wav-to-wem.html` with the V14 version.
+Replace the current `wav-to-wem.html` with the V15 Extended file.
+
+The frontend continues to call:
+
+`https://wav-to-wem-converter.onrender.com`
+
+## YouTube flow
+
+1. Open YouTube -> WEM.
+2. Paste a YouTube link OR search for the song.
+3. Pick the exact video.
+4. Preview it on the page.
+5. Check the authorization confirmation.
+6. Click **Convert to WAV + WEM**.
+7. V15 downloads the audio server-side, creates a WAV, converts the WAV to WEM, and automatically downloads the WEM.
+
+## Important usage note
+
+Only use the YouTube conversion path for audio/video you are authorized to download and use. YouTube's Terms restrict downloading and automated access except where specifically permitted, by permission, or by applicable law. Using the official YouTube Data API for search also does not grant download rights.
+
+V15 does not bypass DRM or other access controls. If YouTube refuses a server-side download, the job reports the failure instead of attempting to circumvent the restriction.
+
+## Diagnostics
+
+After deploy:
+
+`https://wav-to-wem-converter.onrender.com/diagnostics`
+
+Look for:
+- `version: v15-extended`
+- `yt_dlp_self_test: true`
+- `deno_self_test: true`
+- `wav2wem_self_test: true`
+- `youtube_api_configured: true`
+
