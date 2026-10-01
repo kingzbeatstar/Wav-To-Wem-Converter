@@ -23,7 +23,13 @@ ARG DENO_VERSION=2.9.7
 ARG BGUTIL_VERSION=2.0.0
 
 RUN useradd --create-home --uid 10001 appuser \
-    && usermod -a -G 1000 appuser \
+    && if getent group 1000 >/dev/null 2>&1; then \
+         secret_group="$(getent group 1000 | cut -d: -f1)"; \
+       else \
+         groupadd --gid 1000 rendersecrets; \
+         secret_group="rendersecrets"; \
+       fi \
+    && usermod -a -G "$secret_group" appuser \
     && mkdir -p /opt/wav2wem /opt/yt-dlp /opt/bgutil-ytdlp-pot-provider /home/appuser/.wine
 
 # Separate network downloads so Render shows exactly which dependency failed.

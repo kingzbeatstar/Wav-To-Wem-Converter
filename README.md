@@ -1,4 +1,4 @@
-# WAV & YouTube to WEM — V18 Build-Fix
+# WAV & YouTube to WEM — V19 Group-Fix
 
 V17 addresses the specific YouTube error:
 
@@ -82,7 +82,7 @@ Open:
 `https://wav-to-wem-converter.onrender.com/diagnostics`
 
 Look for:
-- `"version": "v18-buildfix"`
+- `"version": "v19-groupfix"`
 - `"youtube_api_configured": true`
 - `"youtube_cookies_present": true`
 - `"bgutil_self_test": true`
@@ -111,3 +111,22 @@ Changes:
 
 ### Upgrade
 Replace the entire `backend` folder with V18. Keep your existing Render environment variables and `youtube-cookies.txt` Secret File. Then choose **Manual Deploy -> Clear build cache & deploy**.
+
+
+## V19 group fix
+
+V18's build failure was caused by:
+
+`usermod -a -G 1000 appuser`
+
+`usermod` requires the target group to exist. Some Docker base images do not contain a group with GID 1000, so it exits with code 6.
+
+V19 now:
+1. Checks whether GID 1000 already exists.
+2. Reuses its real group name if present.
+3. Otherwise creates `rendersecrets` with GID 1000.
+4. Adds `appuser` to that valid group.
+
+All V18 network retry fixes and V17 YouTube cookie/token support remain unchanged.
+
+Upgrade: replace the entire `backend` folder, push to GitHub, then on Render use **Manual Deploy -> Clear build cache & deploy**.
