@@ -60,7 +60,7 @@ type youtubeJobRequest struct {
 }
 
 func main() {
-	log.Printf("wav-to-wem API V19 Group-Fix starting")
+	log.Printf("wav-to-wem API V20 Final starting")
 	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("yt-dlp: %s", ytdlp)
@@ -131,17 +131,17 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v19-groupfix",
+		"version": "v20-final",
 	})
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v19-groupfix"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v20-final"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{
-		"version":                "v19-groupfix",
+		"version":                "v20-final",
 		"wine_home":              wineHome,
 		"wine_prefix":            winePrefix,
 		"converter":              converter,
@@ -307,57 +307,137 @@ func runYouTubeJob(job *YouTubeJob, thumbnail string) {
 	wavTemplate := filepath.Join(dir, "source.%(ext)s")
 	videoURL := "https://www.youtube.com/watch?v=" + job.VideoID
 
-	args := []string{
-		"--no-playlist",
-		"--no-warnings",
-		"--newline",
-		"--progress",
-		"--progress-delta", "1",
-		"--progress-template", "download:PROGRESS=%(progress._percent_str)s",
-		"--js-runtimes", "deno:/opt/yt-dlp/deno",
-		"--extractor-args", "youtube:player-client=web_embedded,mweb",
-		"--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
-		"--sleep-requests", "1",
-		"--sleep-interval", "5",
-		"--max-sleep-interval", "10",
-		"--extract-audio",
-		"--audio-format", "wav",
-		"--audio-quality", "0",
-		"--max-filesize", "200M",
-		"--restrict-filenames",
-		"--output", wavTemplate,
+	// V20 uses an audio-specific selector and multiple current YouTube client
+	// routes. This avoids yt-dlp's normal bestvideo+bestaudio selector and also
+	// avoids forcing web_embedded, which can expose no downloadable A/V formats
+	// for some videos.
+	type ytAttempt struct {
+		Name    string
+		Clients string
+	}
+	attempts := []ytAttempt{
+		{Name: "recommended default+mweb route", Clients: "default,mweb"},
+		{Name: "mweb PO-token route", Clients: "mweb"},
+		{Name: "Safari/HLS compatibility route", Clients: "web_safari"},
+		{Name: "yt-dlp automatic client route", Clients: ""},
 	}
 
-	// Render datacenter IPs are sometimes challenged by YouTube. If the
-	// operator supplies an authenticated cookie jar as a Render Secret File,
-	// use it without ever exposing the contents to the browser or logs.
-	if fileExists(youtubeCookiesPath) {
-		args = append(args, "--cookies", youtubeCookiesPath)
-		if ua := strings.TrimSpace(os.Getenv("YOUTUBE_USER_AGENT")); ua != "" {
-			args = append(args, "--user-agent", ua)
+	buildArgs := func(clients string) []string {
+		args := []string{
+			"--no-playlist",
+			"--no-warnings",
+			"--newline",
+			"--progress",
+			"--progress-delta", "1",
+			"--progress-template", "download:PROGRESS=%(progress._percent_str)s",
+			"--js-runtimes", "deno:/opt/yt-dlp/deno",
+			"--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+			// Explicitly ask for the best audio stream first. If YouTube exposes
+			// only a combined stream, fall back to the best stream containing audio.
+			"--format", "bestaudio/best",
+			"--sleep-requests", "1",
+			"--sleep-interval", "5",
+			"--max-sleep-interval", "10",
+			"--extract-audio",
+			"--audio-format", "wav",
+			"--audio-quality", "0",
+			"--max-filesize", "200M",
+			"--restrict-filenames",
+			"--output", wavTemplate,
 		}
-		log.Printf("YouTube job %s: authenticated cookie jar enabled", job.ID)
-	} else {
-		log.Printf("YouTube job %s: no YouTube cookie secret present; using anonymous session", job.ID)
-	}
-	args = append(args, videoURL)
-
-	log.Printf("YouTube job %s: starting yt-dlp for %s", job.ID, videoURL)
-	out, err := runCommandStreaming(ytdlp, args, func(line string) {
-		if m := percentRE.FindStringSubmatch(line); len(m) == 2 {
-			if p, e := strconv.ParseFloat(m[1], 64); e == nil {
-				// Download+extract phase occupies 0..70% of the total job.
-				mapped := 5 + int(p*0.65)
-				if mapped > 70 {
-					mapped = 70
-				}
-				updateJob(job.ID, func(j *YouTubeJob) { j.Progress = mapped })
+		if clients != "" {
+			args = append(args, "--extractor-args", "youtube:player-client="+clients)
+		}
+		if fileExists(youtubeCookiesPath) {
+			args = append(args, "--cookies", youtubeCookiesPath)
+			if ua := strings.TrimSpace(os.Getenv("YOUTUBE_USER_AGENT")); ua != "" {
+				args = append(args, "--user-agent", ua)
 			}
 		}
-	})
-	if err != nil {
-		log.Printf("YouTube job %s: yt-dlp failed: %v: %s", job.ID, err, clean(out))
-		failJob(job.ID, youtubeFriendlyError(clean(out)))
+		return append(args, videoURL)
+	}
+
+	var (
+		downloadOK  bool
+		lastOutput  []byte
+		lastErr     error
+	)
+	for i, attempt := range attempts {
+		// Remove partial media from a previous route before retrying.
+		if matches, _ := filepath.Glob(filepath.Join(dir, "source.*")); len(matches) > 0 {
+			for _, p := range matches {
+				_ = os.Remove(p)
+			}
+		}
+
+		updateJob(job.ID, func(j *YouTubeJob) {
+			if i == 0 {
+				j.Stage = "Downloading the best available YouTube audio…"
+			} else {
+				j.Stage = fmt.Sprintf("YouTube compatibility fallback %d/%d — %s…", i+1, len(attempts), attempt.Name)
+			}
+			if j.Progress < 5+i*2 {
+				j.Progress = 5 + i*2
+			}
+		})
+
+		if fileExists(youtubeCookiesPath) {
+			log.Printf("YouTube job %s: attempt %d/%d (%s), authenticated cookie jar enabled", job.ID, i+1, len(attempts), attempt.Name)
+		} else {
+			log.Printf("YouTube job %s: attempt %d/%d (%s), anonymous session", job.ID, i+1, len(attempts), attempt.Name)
+		}
+
+		out, runErr := runCommandStreaming(ytdlp, buildArgs(attempt.Clients), func(line string) {
+			if m := percentRE.FindStringSubmatch(line); len(m) == 2 {
+				if p, e := strconv.ParseFloat(m[1], 64); e == nil {
+					mapped := 5 + int(p*0.65)
+					if mapped > 70 {
+						mapped = 70
+					}
+					updateJob(job.ID, func(j *YouTubeJob) {
+						if mapped > j.Progress {
+							j.Progress = mapped
+						}
+					})
+				}
+			}
+		})
+		lastOutput, lastErr = out, runErr
+
+		if runErr == nil {
+			downloadOK = true
+			log.Printf("YouTube job %s: attempt %d succeeded (%s)", job.ID, i+1, attempt.Name)
+			break
+		}
+
+		detail := clean(out)
+		log.Printf("YouTube job %s: attempt %d failed (%s): %v: %s", job.ID, i+1, attempt.Name, runErr, detail)
+
+		// Sometimes post-processing reports a non-zero exit after already
+		// producing a valid WAV. Keep it instead of needlessly failing.
+		if wav, wavErr := findWAV(dir); wavErr == nil {
+			if info, statErr := os.Stat(wav); statErr == nil && info.Size() > 44 {
+				if _, probeErr := execCommand("ffprobe", "-v", "error", "-show_entries", "format=duration",
+					"-of", "default=noprint_wrappers=1:nokey=1", wav); probeErr == nil {
+					downloadOK = true
+					log.Printf("YouTube job %s: keeping valid WAV produced despite yt-dlp non-zero exit", job.ID)
+					break
+				}
+			}
+		}
+
+		if !youtubeRouteRetryable(detail) || i == len(attempts)-1 {
+			break
+		}
+
+		// Small cooldown before changing clients. This reduces repeated rapid
+		// requests against the same video/session on Render.
+		time.Sleep(2 * time.Second)
+	}
+
+	if !downloadOK {
+		log.Printf("YouTube job %s: all applicable yt-dlp routes failed: %v: %s", job.ID, lastErr, clean(lastOutput))
+		failJob(job.ID, youtubeFriendlyError(clean(lastOutput)))
 		os.RemoveAll(dir)
 		return
 	}
@@ -681,6 +761,29 @@ func findWAV(dir string) (string, error) {
 	return matches[0], nil
 }
 
+func youtubeRouteRetryable(detail string) bool {
+	lower := strings.ToLower(detail)
+
+	// These failures can genuinely differ by YouTube client/transport, so V20
+	// retries them through a small set of current compatibility routes.
+	retryable := []string{
+		"requested format is not available",
+		"no formats found",
+		"no video formats found",
+		"only images are available",
+		"no downloadable formats",
+		"http error 403",
+		"403: forbidden",
+		"forbidden",
+	}
+	for _, needle := range retryable {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func youtubeFriendlyError(detail string) string {
 	lower := strings.ToLower(detail)
 	if strings.Contains(lower, "po token") || strings.Contains(lower, "proof of origin") {
@@ -693,13 +796,13 @@ func youtubeFriendlyError(detail string) string {
 		return "YouTube is requiring an authenticated browser session for this Render IP. Add a Render Secret File named youtube-cookies.txt, then redeploy. The backend will use it only server-side."
 	}
 	if strings.Contains(lower, "http error 429") || strings.Contains(lower, "too many requests") {
-		return "YouTube rate-limited this Render IP/session. V17 already slows requests; wait and try again later."
+		return "YouTube rate-limited this Render IP/session. V20 already slows requests; wait and try again later."
 	}
 	if strings.Contains(lower, "http error 403") {
 		return "YouTube returned HTTP 403 for the media stream. This can still happen on datacenter IPs even with tokens/cookies; retry later or use another authorized source."
 	}
 	if strings.Contains(lower, "requested format is not available") || strings.Contains(lower, "no formats found") {
-		return "YouTube did not provide a usable audio format for this video."
+		return "YouTube did not expose a downloadable audio stream after V20 tried its recommended mweb/default, mweb-only, Safari/HLS, and automatic client routes. If this happens only on one video, that video is currently restricted for server-side extraction; if it happens on every video, refresh the YouTube cookie secret."
 	}
 	return "YouTube audio conversion failed: " + detail
 }
