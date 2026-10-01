@@ -60,7 +60,7 @@ type youtubeJobRequest struct {
 }
 
 func main() {
-	log.Printf("wav-to-wem API V17 Extended starting")
+	log.Printf("wav-to-wem API V18 Build-Fix starting")
 	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("yt-dlp: %s", ytdlp)
@@ -131,17 +131,17 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v17-extended",
+		"version": "v18-buildfix",
 	})
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v17-extended"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v18-buildfix"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{
-		"version":                "v17-extended",
+		"version":                "v18-buildfix",
 		"wine_home":              wineHome,
 		"wine_prefix":            winePrefix,
 		"converter":              converter,

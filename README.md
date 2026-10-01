@@ -1,4 +1,4 @@
-# WAV & YouTube to WEM — V17 Extended
+# WAV & YouTube to WEM — V18 Build-Fix
 
 V17 addresses the specific YouTube error:
 
@@ -82,7 +82,7 @@ Open:
 `https://wav-to-wem-converter.onrender.com/diagnostics`
 
 Look for:
-- `"version": "v17-extended"`
+- `"version": "v18-buildfix"`
 - `"youtube_api_configured": true`
 - `"youtube_cookies_present": true`
 - `"bgutil_self_test": true`
@@ -96,3 +96,18 @@ YouTube link/search
 -> FFmpeg WAV
 -> Wine + wav2wem
 -> WEM download
+
+
+## V18 Render build fix
+
+This version addresses curl exit code 6 during the Render Docker build.
+
+Changes:
+- External downloads are separate Docker layers.
+- curl uses IPv4 and retries transient failures up to 10 times.
+- `--retry-all-errors` covers transient DNS/connectivity failures.
+- GitHub cloning uses HTTP/1.1.
+- Existing V17 YouTube cookies, PO-token provider, Deno, FFmpeg, Wine and WEM conversion behavior are preserved.
+
+### Upgrade
+Replace the entire `backend` folder with V18. Keep your existing Render environment variables and `youtube-cookies.txt` Secret File. Then choose **Manual Deploy -> Clear build cache & deploy**.
