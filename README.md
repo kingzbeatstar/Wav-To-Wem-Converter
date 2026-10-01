@@ -1,66 +1,98 @@
-# WAV & YouTube to WEM — V16 Extended
+# WAV & YouTube to WEM — V17 Extended
 
-V16 keeps the working V15 YouTube -> WAV -> WEM pipeline, but fixes the current YouTube server-side download failure by adding the current yt-dlp Proof-of-Origin token provider and a newer yt-dlp nightly build.
+V17 addresses the specific YouTube error:
 
-## Pipeline
+`Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies`
 
-YouTube link/search -> select video -> download authorized audio -> WAV -> wav2wem/Wine 11 -> WEM -> automatic download.
+## What changed
 
-There is no user-WAV upload in YouTube mode.
+- Keeps the V16 PO-token provider, Deno, FFmpeg, Wine 11 and wav2wem pipeline.
+- Adds optional authenticated YouTube cookies from a **Render Secret File**.
+- Adds gentler yt-dlp request pacing to reduce rate-limit pressure.
+- Never sends cookie contents to the browser.
+- Never writes cookie contents to application logs.
+- Adds `youtube_cookies_present` to `/diagnostics`.
+- Adds `.dockerignore` rules so cookie files are not accidentally committed/copied into the image.
+- Adds the app user to group 1000 so Render Docker services can read runtime secret files.
 
-## What changed from V15
+## Important reality
 
-- yt-dlp nightly 2026.09.16.232951 instead of the older stable binary.
-- bgutil-ytdlp-pot-provider 2.0.0 is installed as a yt-dlp plugin.
-- The provider runs locally inside the same Render container on 127.0.0.1:4416.
-- yt-dlp is told to use the embeddable client first and mweb as a token-backed fallback.
-- The provider URL is explicitly supplied to yt-dlp.
-- Startup performs a provider self-test and the API diagnostics endpoint reports it.
-- The 200 MB WAV upload path and proven WAV -> WEM path remain unchanged.
+YouTube can challenge datacenter IP addresses such as Render. There is no code-only flag that guarantees anonymous server-side downloading will work indefinitely.
 
-The yt-dlp project currently documents that YouTube may require Proof-of-Origin tokens and recommends a PO Token provider plugin. The current provider project's 2.0.0 release is the latest release and includes security fixes; it binds locally by default. See the sources below.
+V17 supports the authenticated-session method recommended by yt-dlp for the exact bot-confirmation error, but YouTube can still expire cookies, rate-limit the account/IP, or refuse a stream.
 
-## Render settings
+## Render setup
 
-Runtime: Docker
-Root Directory: backend
-Dockerfile Path: Dockerfile
-Docker Build Context: .
-Health Check Path: /health
+Keep your existing:
+`YOUTUBE_API_KEY`
 
-After pushing V16, use **Manual Deploy -> Clear build cache & deploy** because the image now includes new yt-dlp/plugin/provider layers.
+Then add a Render Secret File:
 
-## Environment
+1. Render dashboard -> `wav-to-wem-converter`
+2. Environment
+3. Secret Files -> Add Secret File
+4. Filename: `youtube-cookies.txt`
+5. Paste a fresh Netscape-format cookie file
+6. Save Changes / redeploy
+
+At runtime Render exposes it at:
+`/etc/secrets/youtube-cookies.txt`
+
+The V17 backend automatically detects and uses it.
+
+### Cookie safety
+
+Cookies are account credentials.
+
+- Do **not** commit the cookie file to GitHub.
+- Do **not** upload it to InfinityFree.
+- Do **not** paste it into ChatGPT or public logs.
+- Prefer a separate browser profile / dedicated YouTube account rather than your primary Google account.
+- yt-dlp warns that using an account can lead to temporary or permanent account restrictions.
+- Refresh the secret if YouTube expires the session.
+
+If you use a matching browser User-Agent, optionally add this Render environment variable:
+
+`YOUTUBE_USER_AGENT=<the user agent from the browser profile that produced the cookies>`
+
+This is optional.
+
+## Deploy
+
+Replace:
+- `backend/main.go`
+- `backend/Dockerfile`
+
+Add:
+- `backend/.dockerignore`
+
+You can also replace `wav-to-wem.html` for the V17 version label.
 
 Keep:
-`YOUTUBE_API_KEY=...`
+- `backend/entrypoint.sh`
+- `backend/go.mod`
+- `render.yaml`
 
-No new secret is required for the PO-token provider.
+Then use:
+**Manual Deploy -> Clear build cache & deploy**
 
 ## Diagnostics
 
-After deploy:
+Open:
 `https://wav-to-wem-converter.onrender.com/diagnostics`
 
 Look for:
-- version: v16-extended
-- yt_dlp_self_test: true
-- deno_self_test: true
-- bgutil_self_test: true
-- wav2wem_self_test: true
-- youtube_api_configured: true
+- `"version": "v17-extended"`
+- `"youtube_api_configured": true`
+- `"youtube_cookies_present": true`
+- `"bgutil_self_test": true`
+- `"yt_dlp_self_test": true`
+- `"wav2wem_self_test": true`
 
-## YouTube usage
+## Pipeline
 
-Use this conversion path only for audio/video you are authorized to download and use. The provider and yt-dlp do not grant permission to download content.
-
-Providing a PO token does not guarantee that YouTube will allow a particular server-side request; the upstream provider explicitly warns that it may not eliminate 403s or bot checks. If YouTube blocks a request on the Render IP, V16 reports the failure rather than attempting to defeat additional access controls.
-
-## Files
-
-- wav-to-wem.html — replace the current website page
-- backend/Dockerfile — replace current Dockerfile
-- backend/entrypoint.sh — add this new file
-- backend/main.go — replace current backend
-- backend/go.mod
-- render.yaml
+YouTube link/search
+-> server-side authenticated yt-dlp session when cookie secret is present
+-> FFmpeg WAV
+-> Wine + wav2wem
+-> WEM download

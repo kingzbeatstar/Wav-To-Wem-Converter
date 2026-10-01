@@ -23,6 +23,7 @@ ARG DENO_VERSION=2.9.7
 ARG BGUTIL_VERSION=2.0.0
 
 RUN useradd --create-home --uid 10001 appuser \
+    && usermod -a -G 1000 appuser \
     && mkdir -p /opt/wav2wem /opt/yt-dlp /opt/bgutil-ytdlp-pot-provider /home/appuser/.wine \
     && curl -fsSL --retry 5 --retry-delay 2 \
        https://github.com/pas2k/wav2wem/releases/download/v0.1/wav2wem.exe \
