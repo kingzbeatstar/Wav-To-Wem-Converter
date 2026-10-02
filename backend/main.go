@@ -60,7 +60,7 @@ type youtubeJobRequest struct {
 }
 
 func main() {
-	log.Printf("wav-to-wem API V20 Final starting")
+	log.Printf("wav-to-wem API V21 Audio-Fix starting")
 	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("yt-dlp: %s", ytdlp)
@@ -131,17 +131,17 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v20-final",
+		"version": "v21-audiofix",
 	})
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v20-final"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v21-audiofix"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{
-		"version":                "v20-final",
+		"version":                "v21-audiofix",
 		"wine_home":              wineHome,
 		"wine_prefix":            winePrefix,
 		"converter":              converter,
@@ -152,6 +152,8 @@ func diagnostics(w http.ResponseWriter, r *http.Request) {
 		"youtube_api_configured": youtubeAPIKey() != "",
 		"youtube_cookies_present": fileExists(youtubeCookiesPath),
 		"bgutil_provider": bgutilPing,
+		"ffmpeg_present": fileExists("/usr/bin/ffmpeg"),
+		"ffprobe_present": fileExists("/usr/bin/ffprobe"),
 	}
 	out, err := runWine("--version")
 	result["wine_available"] = err == nil
@@ -460,7 +462,7 @@ func runYouTubeJob(job *YouTubeJob, thumbnail string) {
 
 	updateJob(job.ID, func(j *YouTubeJob) {
 		j.Status = "converting"
-		j.Stage = "YouTube audio is ready as WAV — converting WAV to WEM…"
+		j.Stage = "Rendering Beatstar-safe 44.1 kHz stereo PCM, then converting to WEM…"
 		j.Progress = 72
 	})
 
@@ -742,15 +744,93 @@ func youtubeOEmbed(ctx context.Context, videoID string) (string, string, error) 
 }
 
 func runWavToWem(input, output string) (string, error) {
-	args := []string{converter, winePath(input), "-o", winePath(output), "-q", "4"}
+	// Beatstar's known-good music WEMs use a conventional stereo/44.1 kHz
+	// source profile. YouTube commonly supplies 48 kHz Opus/AAC, and WAV can
+	// also be float/24-bit/multichannel. wav2wem may accept those inputs while
+	// the resulting media is not usable by the game's playback path.
+	//
+	// Always render a clean intermediate PCM WAV first:
+	//   PCM signed 16-bit little-endian, stereo, 44.1 kHz.
+	normalized := filepath.Join(filepath.Dir(output), "beatstar_pcm_44100_stereo_s16.wav")
+	if err := normalizeBeatstarWAV(input, normalized); err != nil {
+		return "", err
+	}
+	defer os.Remove(normalized)
+
+	args := []string{converter, winePath(normalized), "-o", winePath(output), "-q", "4"}
 	out, err := runCommandStreaming("wine", args, func(string) {})
 	if err != nil {
 		return "", fmt.Errorf("wav2wem: %s", clean(out))
 	}
-	if info, e := os.Stat(output); e != nil || info.Size() == 0 {
-		return "", fmt.Errorf("converter completed but no WEM was produced")
+	if info, e := os.Stat(output); e != nil || info.Size() <= 44 {
+		return "", fmt.Errorf("converter completed but no valid WEM was produced")
 	}
 	return output, nil
+}
+
+func normalizeBeatstarWAV(input, output string) error {
+	args := []string{
+		"-nostdin",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-y",
+		"-i", input,
+		"-map", "0:a:0",
+		"-vn",
+		"-sn",
+		"-dn",
+		"-ac", "2",
+		"-ar", "44100",
+		"-c:a", "pcm_s16le",
+		"-map_metadata", "-1",
+		output,
+	}
+	out, err := execCommand("ffmpeg", args...)
+	if err != nil {
+		return fmt.Errorf("Beatstar PCM rendering failed: %s", clean(out))
+	}
+
+	info, err := os.Stat(output)
+	if err != nil || info.Size() <= 44 {
+		return fmt.Errorf("Beatstar PCM rendering produced no usable audio")
+	}
+
+	// Verify the exact audio contract before handing it to wav2wem.
+	probe, err := execCommand(
+		"ffprobe",
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name,sample_rate,channels,bits_per_sample",
+		"-of", "default=noprint_wrappers=1",
+		output,
+	)
+	if err != nil {
+		return fmt.Errorf("could not verify rendered WAV: %s", clean(probe))
+	}
+	p := strings.ToLower(clean(probe))
+	if !strings.Contains(p, "codec_name=pcm_s16le") ||
+		!strings.Contains(p, "sample_rate=44100") ||
+		!strings.Contains(p, "channels=2") {
+		return fmt.Errorf("rendered WAV did not match Beatstar-safe PCM profile: %s", clean(probe))
+	}
+
+	// Detect the pathological case where a pipeline technically produced a WAV
+	// but its samples are entirely silent.
+	volume, _ := execCommand(
+		"ffmpeg",
+		"-nostdin",
+		"-hide_banner",
+		"-i", output,
+		"-af", "volumedetect",
+		"-f", "null",
+		"-",
+	)
+	if strings.Contains(strings.ToLower(clean(volume)), "max_volume: -inf") {
+		return fmt.Errorf("rendered WAV contains only silence; conversion stopped before creating a silent WEM")
+	}
+
+	log.Printf("Beatstar PCM render OK: pcm_s16le, stereo, 44100 Hz (%d bytes)", info.Size())
+	return nil
 }
 
 func findWAV(dir string) (string, error) {
@@ -796,7 +876,7 @@ func youtubeFriendlyError(detail string) string {
 		return "YouTube is requiring an authenticated browser session for this Render IP. Add a Render Secret File named youtube-cookies.txt, then redeploy. The backend will use it only server-side."
 	}
 	if strings.Contains(lower, "http error 429") || strings.Contains(lower, "too many requests") {
-		return "YouTube rate-limited this Render IP/session. V20 already slows requests; wait and try again later."
+		return "YouTube rate-limited this Render IP/session. V21 already slows requests; wait and try again later."
 	}
 	if strings.Contains(lower, "http error 403") {
 		return "YouTube returned HTTP 403 for the media stream. This can still happen on datacenter IPs even with tokens/cookies; retry later or use another authorized source."
