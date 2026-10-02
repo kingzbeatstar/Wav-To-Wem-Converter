@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,7 +61,7 @@ type youtubeJobRequest struct {
 }
 
 func main() {
-	log.Printf("wav-to-wem API V21 Audio-Fix starting")
+	log.Printf("wav-to-wem API V22 Beatstar-Fix starting")
 	log.Printf("converter: Windows wav2wem.exe v0.1 via Wine")
 	log.Printf("converter path: %s", converter)
 	log.Printf("yt-dlp: %s", ytdlp)
@@ -131,17 +132,17 @@ func root(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "wav-to-wem-converter",
 		"ok":      true,
-		"version": "v21-audiofix",
+		"version": "v22-beatstar-fix",
 	})
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v21-audiofix"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": "v22-beatstar-fix"})
 }
 
 func diagnostics(w http.ResponseWriter, r *http.Request) {
 	result := map[string]any{
-		"version":                "v21-audiofix",
+		"version":                "v22-beatstar-fix",
 		"wine_home":              wineHome,
 		"wine_prefix":            winePrefix,
 		"converter":              converter,
@@ -154,6 +155,8 @@ func diagnostics(w http.ResponseWriter, r *http.Request) {
 		"bgutil_provider": bgutilPing,
 		"ffmpeg_present": fileExists("/usr/bin/ffmpeg"),
 		"ffprobe_present": fileExists("/usr/bin/ffprobe"),
+		"beatstar_channel_config": "0x3102 (stereo)",
+		"beatstar_wem_profile": "Wwise Vorbis / fmt 0x42 / 2ch / 44100 Hz",
 	}
 	out, err := runWine("--version")
 	result["wine_available"] = err == nil
@@ -765,7 +768,173 @@ func runWavToWem(input, output string) (string, error) {
 	if info, e := os.Stat(output); e != nil || info.Size() <= 44 {
 		return "", fmt.Errorf("converter completed but no valid WEM was produced")
 	}
+
+	// wav2wem v0.1 currently leaves the new-format Wwise channel-config field
+	// as zero for stereo streams. Beatstar: Touch Your Music media uses the
+	// standard Wwise stereo AkChannelConfig value 0x3102. A WEM can decode in
+	// generic tools while still being rejected/muted by the game's Wwise path
+	// when this field is invalid.
+	if err := patchBeatstarWEMHeader(output); err != nil {
+		return "", fmt.Errorf("Beatstar WEM compatibility patch failed: %w", err)
+	}
 	return output, nil
+}
+
+func patchBeatstarWEMHeader(path string) error {
+	const beatstarStereoChannelConfig uint32 = 0x00003102
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := info.Size()
+	if fileSize < 20 {
+		return fmt.Errorf("WEM is too small (%d bytes)", fileSize)
+	}
+
+	var riff [12]byte
+	if _, err := f.ReadAt(riff[:], 0); err != nil {
+		return err
+	}
+	if string(riff[0:4]) != "RIFF" || string(riff[8:12]) != "WAVE" {
+		return fmt.Errorf("not a RIFF/WAVE WEM")
+	}
+
+	declared := int64(binary.LittleEndian.Uint32(riff[4:8])) + 8
+	if declared > fileSize {
+		return fmt.Errorf("truncated RIFF: header declares %d bytes, file has %d", declared, fileSize)
+	}
+
+	var (
+		fmtFound  bool
+		dataFound bool
+		oldConfig uint32
+		samples   uint32
+	)
+	for pos := int64(12); pos+8 <= fileSize; {
+		var ch [8]byte
+		if _, err := f.ReadAt(ch[:], pos); err != nil {
+			return err
+		}
+		tag := string(ch[0:4])
+		size := int64(binary.LittleEndian.Uint32(ch[4:8]))
+		body := pos + 8
+
+		if size < 0 || body+size > fileSize {
+			return fmt.Errorf("invalid %q chunk size %d at 0x%x", tag, size, pos)
+		}
+
+		switch tag {
+		case "fmt ":
+			if fmtFound {
+				return fmt.Errorf("duplicate fmt chunk")
+			}
+			fmtFound = true
+			if size != 0x42 {
+				return fmt.Errorf("unexpected Wwise Vorbis fmt size 0x%x (expected 0x42)", size)
+			}
+
+			buf := make([]byte, 0x42)
+			if _, err := f.ReadAt(buf, body); err != nil {
+				return err
+			}
+
+			format := binary.LittleEndian.Uint16(buf[0x00:0x02])
+			channels := binary.LittleEndian.Uint16(buf[0x02:0x04])
+			rate := binary.LittleEndian.Uint32(buf[0x04:0x08])
+			blockAlign := binary.LittleEndian.Uint16(buf[0x0c:0x0e])
+			bitsPerSample := binary.LittleEndian.Uint16(buf[0x0e:0x10])
+			extraSize := binary.LittleEndian.Uint16(buf[0x10:0x12])
+			oldConfig = binary.LittleEndian.Uint32(buf[0x14:0x18])
+			samples = binary.LittleEndian.Uint32(buf[0x18:0x1c])
+
+			if format != 0xffff {
+				return fmt.Errorf("unexpected WEM codec 0x%04x (expected Wwise Vorbis 0xffff)", format)
+			}
+			if channels != 2 {
+				return fmt.Errorf("unexpected channel count %d after stereo normalization", channels)
+			}
+			if rate != 44100 {
+				return fmt.Errorf("unexpected sample rate %d after 44.1 kHz normalization", rate)
+			}
+			if blockAlign != 0 || bitsPerSample != 0 || extraSize != 0x30 {
+				return fmt.Errorf(
+					"unexpected modern Wwise Vorbis fmt fields: blockAlign=%d bits=%d extra=0x%x",
+					blockAlign, bitsPerSample, extraSize,
+				)
+			}
+			if samples == 0 {
+				return fmt.Errorf("WEM reports zero PCM frames")
+			}
+
+			if oldConfig != beatstarStereoChannelConfig {
+				var cfg [4]byte
+				binary.LittleEndian.PutUint32(cfg[:], beatstarStereoChannelConfig)
+				if _, err := f.WriteAt(cfg[:], body+0x14); err != nil {
+					return err
+				}
+			}
+
+		case "data":
+			if size > 0 {
+				dataFound = true
+			}
+		}
+
+		pos = body + size
+		if size&1 != 0 {
+			pos++
+		}
+	}
+
+	if !fmtFound {
+		return fmt.Errorf("fmt chunk not found")
+	}
+	if !dataFound {
+		return fmt.Errorf("non-empty data chunk not found")
+	}
+
+	// Re-read the patched field from disk rather than trusting our write.
+	var verify [4]byte
+	// Locate fmt again; normal new-format WEM emitted by wav2wem starts at 0x0c,
+	// but use a chunk walk so this also remains safe if a chunk is added later.
+	for pos := int64(12); pos+8 <= fileSize; {
+		var ch [8]byte
+		if _, err := f.ReadAt(ch[:], pos); err != nil {
+			return err
+		}
+		size := int64(binary.LittleEndian.Uint32(ch[4:8]))
+		body := pos + 8
+		if string(ch[0:4]) == "fmt " {
+			if _, err := f.ReadAt(verify[:], body+0x14); err != nil {
+				return err
+			}
+			break
+		}
+		pos = body + size
+		if size&1 != 0 {
+			pos++
+		}
+	}
+	got := binary.LittleEndian.Uint32(verify[:])
+	if got != beatstarStereoChannelConfig {
+		return fmt.Errorf("channel config verification failed: got 0x%08x", got)
+	}
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	log.Printf(
+		"Beatstar WEM header OK: stereo channel config 0x%04x (was 0x%04x), 44100 Hz, %d PCM frames",
+		got, oldConfig, samples,
+	)
+	return nil
 }
 
 func normalizeBeatstarWAV(input, output string) error {

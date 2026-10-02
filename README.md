@@ -1,58 +1,67 @@
-# WAV / YouTube → WEM — V21 Audio-Fix
+# WAV / YouTube → WEM — V22 Beatstar-Fix
 
-V21 keeps the working V20 YouTube download pipeline and fixes the audio handoff before `wav2wem`.
+V22 is specifically for **Beatstar: Touch Your Music**.
 
-## Why V20 could make a WEM that is silent in Beatstar
+V21 correctly normalized the source audio to 44.1 kHz / stereo / PCM16, but that only fixed the WAV side. The remaining mismatch was inside the generated Wwise Vorbis `.wem` header.
 
-YouTube commonly supplies 48 kHz Opus/AAC audio. Uploaded WAV files can also be float, 24/32-bit PCM, mono, multichannel, or use other layouts.
+## Root cause addressed in V22
 
-The converter could technically accept the WAV and produce a `.wem`, but that does not guarantee that Beatstar's expected playback path will like the resulting media profile.
+The `wav2wem` implementation used by the service writes the modern Wwise Vorbis `fmt` structure, but for stereo its channel-configuration/subtype field is left as `0`.
 
-The known-good Beatstar reference used during development is stereo at 44.1 kHz.
+Beatstar music media uses the normal Wwise stereo channel configuration:
 
-## V21 audio pipeline
+`0x3102` = stereo / 2.0
 
-Every input now goes through this exact normalization before WEM conversion:
+V22 therefore performs a strict Beatstar compatibility pass *after* wav2wem creates the WEM:
+
+1. Verify RIFF/WAVE.
+2. Verify Wwise Vorbis codec `0xFFFF`.
+3. Verify modern `fmt` size `0x42`.
+4. Verify 2 channels.
+5. Verify 44,100 Hz.
+6. Verify the Vorbis extended-format fields.
+7. Patch the Wwise channel config to `0x3102`.
+8. Re-read the value from disk and verify it.
+9. Require a non-empty `data` chunk and non-zero sample count.
+
+The patch changes only the Wwise stereo channel-layout field. It does not blindly copy file-specific hashes, offsets, sample counts, packet sizes, or loop metadata from another song.
+
+## Audio pipeline
 
 YouTube / uploaded WAV
-→ FFmpeg
-→ **PCM signed 16-bit little-endian**
-→ **stereo**
-→ **44,100 Hz**
-→ metadata stripped
-→ ffprobe verification
-→ silence check
-→ Wine + wav2wem
-→ WEM
+→ FFmpeg clean PCM16 stereo 44.1 kHz
+→ wav2wem / Wwise Vorbis
+→ **Beatstar WEM header validation + stereo config 0x3102**
+→ `.wem`
 
-This applies to BOTH:
-- normal WAV → WEM
-- YouTube → WAV → WEM
+The working V20 YouTube downloader, cookies, Deno, PO-token provider and fallback routes are unchanged.
 
-V21 does not change the working V20 YouTube client/cookie/PO-token fallback system.
+## Upgrade from V21
 
-## Upgrade
+Replace the entire `backend` folder with V22:
 
-Replace your entire current `backend` folder with the V21 `backend` folder.
+- `.dockerignore`
+- `Dockerfile`
+- `entrypoint.sh`
+- `go.mod`
+- `main.go`
 
-Keep your existing Render settings:
+Keep your existing Render environment:
 - `YOUTUBE_API_KEY`
 - `YOUTUBE_USER_AGENT` if configured
 - Secret File `youtube-cookies.txt`
 
-Then:
+Then use:
+
 **Render → Manual Deploy → Clear build cache & deploy**
 
-The included HTML only updates the version label; the important fix is in `backend/main.go`.
+The included HTML only changes the displayed version label; the Beatstar playback fix is server-side.
 
 ## Diagnostics
 
-After deploy, `/diagnostics` should show:
-- `version: v21-audiofix`
-- `ffmpeg_present: true`
-- `ffprobe_present: true`
-- the existing yt-dlp / Deno / bgutil / wav2wem checks passing
+`/diagnostics` should show:
 
-## Safety check
-
-If FFmpeg somehow renders an all-silent WAV, V21 now stops with a clear error instead of generating a silent `.wem`.
+- `version: v22-beatstar-fix`
+- `beatstar_channel_config: 0x3102 (stereo)`
+- `beatstar_wem_profile: Wwise Vorbis / fmt 0x42 / 2ch / 44100 Hz`
+- the existing Wine, wav2wem, FFmpeg, yt-dlp, Deno and bgutil tests passing.
